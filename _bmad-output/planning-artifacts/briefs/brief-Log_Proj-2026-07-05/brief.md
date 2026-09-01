@@ -2,7 +2,7 @@
 title: "Brief de Producto: [Nombre por definir] — Mini ERP (WMS + CRM Light) para Dropshipping"
 status: draft
 created: 2026-07-05
-updated: 2026-07-05
+updated: 2026-08-27
 ---
 
 # Brief de Producto: [Nombre por definir]
@@ -19,6 +19,8 @@ Las operaciones de dropshipping y logística en Latinoamérica que trabajan con 
 - **Devoluciones sin trazabilidad:** cuando una transportadora reemplaza la guía original por una de retorno, se pierde la relación entre ambas. Cruzar esa información con Dropi manualmente "consume horas operativas críticas", y con cientos o miles de devoluciones diarias el costo operativo escala rápido.
 - **Gestión comercial reactiva:** "Nadie recibe una alerta cuando un dropshipper disminuye significativamente sus pedidos... nos damos cuenta demasiado tarde." No existe CRM ni regla de negocio que vigile caídas de volumen.
 - **Datos fragmentados entre canales:** la operación no vive solo en Dropi — también hay ventas en Mercado Libre y otras empresas del grupo. "La información existe, pero queda encerrada dentro de ciertos procesos." Dropi se usa como si fuera un WMS, pero no lo es: no ofrece una reconciliación cruzada de canales ni resuelve el problema de las guías reemplazatorias.
+- **Mercancía sin código de barras:** parte de la mercancía que el cliente piloto importa no trae código de barras de fábrica, lo que rompe el flujo de "un escaneo = una acción" para ese subconjunto de productos.
+- **Devoluciones masivas sin detalle:** al menos dos transportadoras devuelven mercancía sin indicar en la guía qué contiene el paquete — llega el bulto físico, pero la información de la transportadora no dice a qué pedido u orden pertenece cada unidad.
 
 El costo del status quo: horas operativas perdidas en conteos y cruces manuales, decisiones comerciales tardías, y una operación que "funciona mientras el volumen es manejable" pero no escala.
 
@@ -26,7 +28,7 @@ El costo del status quo: horas operativas perdidas en conteos y cruces manuales,
 
 Un Mini ERP centralizado con dos módulos que comparten una única fuente de verdad operativa:
 
-- **WMS (Control de Inventario y Devoluciones):** registro de ingreso de mercancía por escaneo (sin digitación), tablero de stock en tiempo real visible para todo el equipo logístico, vinculación guiada de guía original ↔ guía de retorno, y tipificación de devoluciones en máximo 3 clics (Compra Falsa / Rechazo Cliente / Retraso Bodega / Daño Transportadora).
+- **WMS (Control de Inventario y Devoluciones):** registro de ingreso de mercancía por escaneo (sin digitación), con alternativa manual guiada para productos sin código de barras; tablero de stock en tiempo real visible para todo el equipo logístico; vinculación guiada de guía original ↔ guía de retorno; tipificación de devoluciones en máximo 3 clics (Compra Falsa / Rechazo Cliente / Retraso Bodega / Daño Transportadora); y una pantalla de asignación manual para devoluciones masivas sin detalle, donde el operador registra la guía de la transportadora y va asignando cada unidad devuelta a su pedido de origen.
 - **CRM Light (Alertas Comerciales Preventivas):** monitoreo automático (worker diario) del volumen de pedidos por dropshipper; si cae por debajo de un umbral, se dispara una alerta priorizada al asesor comercial con un enlace directo a WhatsApp para contacto de retención inmediato.
 
 Todo bajo una interfaz táctil pensada para personal operativo de bodega, no para "power users": pistola de escaneo Bluetooth/USB, botones gigantes, semáforo de colores, cero campos de texto libre donde se pueda evitar.
@@ -62,13 +64,14 @@ Para el MVP con la empresa piloto, esto funciona si:
 
 ## Alcance
 
-**Dentro del MVP** (exactamente las 5 historias de usuario ya definidas):
+**Dentro del MVP** (las 5 historias de usuario originales + HU-06, incorporada tras feedback de socio sobre devoluciones sin detalle — ver `addendum.md`):
 
-1. Registro de stock mediante escaneo único con pistola (HU-01).
+1. Registro de stock mediante escaneo único con pistola, con fallback manual para mercancía sin código de barras (HU-01).
 2. Tablero operativo de stock en tiempo real, sincronizado con Dropi y Mercado Libre (HU-02).
 3. Vinculación inteligente de guías — trazabilidad recuperada entre guía origen y guía de retorno (HU-03).
 4. Tipificación táctil rápida de causas de devolución, en menos de 3 clics (HU-04).
 5. Disparador de alertas por caída crítica de volumen de un dropshipper (HU-05).
+6. Asignación manual de devoluciones sin detalle, para transportadoras que devuelven mercancía en bulto sin indicar a qué pedido pertenece cada unidad (HU-06).
 
 El MVP debe quedar **ejecutable en la nube**, listo para que la empresa piloto lo use en su operación real.
 

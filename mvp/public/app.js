@@ -38,7 +38,7 @@ const LABEL = { tablero: 'Stock', pedidos: 'Pedidos', ingreso: 'Ingresar Mercanc
 const VIEWS = {};
 let current = null;
 
-function logout() { localStorage.removeItem('session'); session = null; es?.close(); boot(); }
+function logout() { if (session) fetch('/api/logout', { method: 'POST', headers: { Authorization: 'Bearer ' + session.token } }).catch(() => {}); localStorage.removeItem('session'); session = null; es?.close(); boot(); }
 
 function go(tab) {
   current = tab;
@@ -51,6 +51,7 @@ function liveStock(onChange) {
   es?.close();
   es = new EventSource('/api/events?t=' + session.token);
   es.addEventListener('stock', () => onChange());
+  es.onerror = () => { if (es.readyState === EventSource.CLOSED) toast('Tiempo real desconectado; recarga la pantalla', true); };
 }
 
 function boot() {
@@ -126,7 +127,8 @@ VIEWS.ingreso = (v) => {
   const counter = h('span', { class: 'big-num' }, '0');
   const m1 = h('button', { class: 'sel', onclick: () => setMult(1) }, '+1'), m10 = h('button', { class: 'ghost', onclick: () => setMult(10) }, '+10');
   const setMult = (n) => { mult = n; m1.className = n === 1 ? 'sel' : 'ghost'; m10.className = n === 10 ? 'sel' : 'ghost'; };
-  const ensure = async () => ingesta ??= (await api('POST', '/inventario/ingesta')).ingesta_id;
+  let ingestaP = null; // store the promise so two fast first scans share one ingesta
+  const ensure = () => (ingestaP ??= api('POST', '/inventario/ingesta').then((r) => (ingesta = r.ingesta_id)).catch((e) => { ingestaP = null; throw e; }));
   const addLog = (txt) => { if (log.firstChild?.className === 'mut') log.replaceChildren(); log.prepend(h('div', { class: 'item' }, txt)); };
 
   const onScan = (code) => act(async () => {
@@ -136,6 +138,7 @@ VIEWS.ingreso = (v) => {
       total += mult; counter.textContent = total;
       status.replaceChildren(h('div', { class: 'row flash' }, h('span', { class: 'pill verde' }, 'PRODUCTO RECONOCIDO'), h('strong', {}, r.product.name), h('span', { class: 'mut' }, `stock ${r.product.stock}`)));
       addLog(`+${mult} ${r.product.name}`);
+      scan.focus();
     } catch (e) {
       if (e.status === 404) { status.replaceChildren(h('div', { class: 'row' }, h('span', { class: 'pill rojo' }, 'NO RECONOCIDO'), h('span', {}, code), h('button', { class: 'warn', onclick: () => manual(code) }, 'Sin código de barras'))); }
       else throw e;
@@ -172,6 +175,10 @@ VIEWS.ingreso = (v) => {
     toast(`Ingesta #${r.ingesta_id} guardada: ${r.unidades} unidades`);
     v.replaceChildren(); VIEWS.ingreso(v);
   });
+  // Scanner guns type into whatever has focus: after any button tap, or stray keystrokes, send focus back to the scan box.
+  v.addEventListener('click', () => setTimeout(() => { if (!manualBox.hasChildNodes()) scan.focus(); }, 0));
+  const keyCatcher = (e) => { if (current === 'ingreso' && !manualBox.hasChildNodes() && e.target.tagName !== 'INPUT' && e.key.length === 1) scan.focus(); };
+  document.removeEventListener('keydown', VIEWS._kc); VIEWS._kc = keyCatcher; document.addEventListener('keydown', keyCatcher);
   v.append(h('h2', {}, 'Ingresar Mercancía'), h('div', { class: 'card' }, h('div', { class: 'row' }, scan, ), h('div', { class: 'row', style: 'margin-top:10px' }, m1, m10, h('span', { class: 'mut' }, 'Unidades en esta ingesta:'), counter)), status, h('button', { class: 'warn', onclick: () => manual('') }, 'Sin código de barras'), manualBox, h('h3', {}, 'Registro'), log,
     h('button', { class: 'big ok', onclick: save }, 'Guardar Ingesta'));
 };

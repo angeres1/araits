@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { openDb } from './db.js';
 import * as L from './logic.js';
-import { login, userFromToken, publicUsers, can } from './auth.js';
+import { login, logout, userFromToken, publicUsers, can } from './auth.js';
 import { syncOrders, mode } from './adapters.js';
 
 const PUBLIC = join(fileURLToPath(import.meta.url), '../../public');
@@ -20,7 +20,8 @@ export function createApp(db = openDb()) {
   const r = (method, path, perm, fn) => routes.push([method, new RegExp(`^${path.replace(/:(\w+)/g, '(?<$1>[^/]+)')}$`), perm, fn]);
 
   r('GET', '/api/users', null, () => publicUsers(db));
-  r('POST', '/api/login', null, ({ body }) => login(db, body));
+  r('POST', '/api/login', null, ({ body, ip }) => login(db, body, ip));
+  r('POST', '/api/logout', 'auth', ({ token }) => logout(db, token));
   r('GET', '/api/me', 'auth', ({ user }) => ({ ...user, channels: mode() }));
 
   r('GET', '/api/inventario/stock', 'stock', ({ query }) => L.listStock(db, query.get('q') || ''));
@@ -32,6 +33,7 @@ export function createApp(db = openDb()) {
 
   r('GET', '/api/pedidos', 'pedidos', ({ query }) => L.listOrders(db, query.get('status') || 'pendiente'));
   r('POST', '/api/pedidos/:id/despachar', 'pedidos', ({ params }) => L.dispatchOrder(db, Number(params.id), bus));
+  r('POST', '/api/pedidos/:id/cancelar', 'pedidos', ({ params }) => L.cancelOrder(db, Number(params.id), bus));
   r('POST', '/api/sync', 'admin', () => syncOrders(db, bus));
 
   r('GET', '/api/devoluciones', 'devoluciones_ver', ({ query }) => L.listReturns(db, query.get('status') || 'abierta'));
@@ -39,7 +41,7 @@ export function createApp(db = openDb()) {
   r('POST', '/api/devoluciones/vincular', 'vincular', ({ body, user }) => L.vincular(db, body, user.id));
   r('POST', '/api/devoluciones/sin-detalle', 'vincular', ({ body, user }) => L.sinDetalle(db, body, user.id));
   r('GET', '/api/devoluciones/:id/candidatos', 'vincular', ({ params, query }) => L.candidatos(db, Number(params.id), query.get('q') || ''));
-  r('POST', '/api/devoluciones/:id/asignar', 'vincular', ({ params, body }) => L.asignar(db, Number(params.id), Number(body.order_id)));
+  r('POST', '/api/devoluciones/:id/asignar', 'vincular', ({ params, body }) => L.asignar(db, Number(params.id), Number(body.order_id), body.qty ?? 1));
   r('POST', '/api/devoluciones/:id/cerrar', 'vincular', ({ params }) => L.cerrarDevolucion(db, Number(params.id)));
   r('DELETE', '/api/devoluciones/unidades/:uid', 'vincular', ({ params }) => L.revertirAsignacion(db, Number(params.uid)));
   r('PATCH', '/api/devoluciones/tipificar', 'tipificar', ({ body, user }) => L.tipificar(db, body, user.id, bus));
@@ -55,11 +57,12 @@ export function createApp(db = openDb()) {
     const chunks = []; let size = 0;
     for await (const c of req) { size += c.length; if (size > 1_000_000) throw new L.HttpError(413, 'payload_grande'); chunks.push(c); }
     if (!chunks.length) return {};
-    try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { throw new L.HttpError(400, 'json_invalido'); }
+    try { const b = JSON.parse(Buffer.concat(chunks).toString()); return b && typeof b === 'object' && !Array.isArray(b) ? b : {}; } catch { throw new L.HttpError(400, 'json_invalido'); }
   }
 
   async function handleApi(req, res, url) {
-    const token = (req.headers.authorization || '').replace(/^Bearer /, '') || url.searchParams.get('t');
+    // ?t= is only honoured for the SSE stream (EventSource cannot send headers).
+    const token = (req.headers.authorization || '').replace(/^Bearer /, '') || (url.pathname === '/api/events' ? url.searchParams.get('t') : null);
     for (const [method, re, perm, fn] of routes) {
       const m = req.method === method && re.exec(url.pathname);
       if (!m) continue;
@@ -70,7 +73,7 @@ export function createApp(db = openDb()) {
         if (perm !== 'auth' && !(perm === 'admin' ? user.role === 'admin' : can(user, perm))) throw new L.HttpError(403, 'sin_permiso');
       }
       const body = ['POST', 'PATCH', 'PUT'].includes(method) ? await readBody(req) : {};
-      return send(res, 200, await fn({ params: m.groups || {}, query: url.searchParams, body, user }));
+      return send(res, 200, await fn({ params: m.groups || {}, query: url.searchParams, body, user, token, ip: req.socket.remoteAddress }));
     }
     if (url.pathname === '/api/events' && req.method === 'GET') {
       if (!userFromToken(db, token)) throw new L.HttpError(401, 'no_autenticado');
@@ -78,7 +81,7 @@ export function createApp(db = openDb()) {
       res.write('retry: 2000\n\n');
       const on = (d) => res.write(`event: stock\ndata: ${JSON.stringify(d)}\n\n`);
       bus.on('stock', on);
-      const ka = setInterval(() => res.write(': ka\n\n'), 25000);
+      const ka = setInterval(() => { if (!userFromToken(db, token)) return res.end(); res.write(': ka\n\n'); }, 25000);
       req.on('close', () => { bus.off('stock', on); clearInterval(ka); });
       return;
     }
@@ -91,8 +94,9 @@ export function createApp(db = openDb()) {
   };
 
   const server = createServer(async (req, res) => {
-    const url = new URL(req.url, 'http://x');
     try {
+      let url;
+      try { url = new URL(req.url, 'http://x'); } catch { throw new L.HttpError(400, 'url_invalida'); }
       if (url.pathname.startsWith('/api/')) return await handleApi(req, res, url);
       const rel = normalize(url.pathname === '/' ? '/index.html' : url.pathname).replace(/^(\.\.[/\\])+/, '');
       const file = join(PUBLIC, rel);
@@ -117,13 +121,16 @@ export function startWorker(db) {
   let last = '';
   return setInterval(() => {
     const d = new Date();
-    const key = d.toISOString().slice(0, 10);
-    if (d.getHours() >= 3 && last !== key) { last = key; console.log('[worker] alertas', L.runAlerts(db)); }
+    const key = L.localDay(d);
+    const local = new Date(d.getTime() + L.TZ_OFFSET_MIN * 60000);
+    if (local.getUTCHours() >= 3 && last !== key) { last = key; console.log('[worker] alertas', L.runAlerts(db)); }
   }, 3600_000);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const { server, db } = createApp();
+  process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
+  process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
   startWorker(db);
   const port = Number(process.env.PORT || 3000);
   server.listen(port, () => console.log(`Log_Proj MVP en http://localhost:${port}  (canales: ${mode()})`));

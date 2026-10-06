@@ -122,3 +122,38 @@ test('FR-7/FR-8 alert on >=90% drop vs 7-day baseline; ficha; umbral; idempotent
   assert.equal((await call('PATCH', '/api/dropshippers/1', 'comercial', { umbral_pct: 150 })).status, 400);
   assert.equal((await call('POST', `/api/alertas/${al[0].id}/atender`, 'comercial')).body.status, 'atendida');
 });
+
+test('review fixes: partial return qty, bad URL does not crash, day validation, svg photo rejected, ?t only on events, logout', async () => {
+  const db = app.db;
+  db.prepare("INSERT INTO orders (dropshipper_id, product_id, qty, channel, status, guia_despacho, created_at) VALUES (1,1,2,'dropi','despachado','GD-Q2',?)").run(new Date().toISOString());
+  const s = await call('POST', '/api/devoluciones/sin-detalle', 'devoluciones', { guia_retorno: 'RET-Q' });
+  assert.equal((await call('POST', '/api/devoluciones/sin-detalle', 'devoluciones', { guia_retorno: 'RET-Q' })).body.id, s.body.id, 'reuses open bulto');
+  assert.equal((await call('POST', `/api/devoluciones/${s.body.id}/cerrar`, 'devoluciones')).status, 409, 'empty bulto cannot close');
+  const oid = db.prepare("SELECT id FROM orders WHERE guia_despacho='GD-Q2'").get().id;
+  const a = await call('POST', `/api/devoluciones/${s.body.id}/asignar`, 'devoluciones', { order_id: oid });
+  assert.equal(a.body.units[0].qty, 1);
+  const stock0 = db.prepare('SELECT stock FROM products WHERE id=1').get().stock;
+  await call('PATCH', '/api/devoluciones/tipificar', 'operador', { unit_id: a.body.units[0].id, causa: 'Retraso Bodega' });
+  assert.equal(db.prepare('SELECT stock FROM products WHERE id=1').get().stock, stock0 + 1, 'only 1 of 2 units restocked');
+  assert.equal(db.prepare('SELECT status FROM orders WHERE id=?').get(oid).status, 'despachado', 'not fully returned yet');
+  assert.equal((await call('POST', `/api/devoluciones/${s.body.id}/asignar`, 'devoluciones', { order_id: oid, qty: 2 })).status, 409, 'over-return blocked');
+  assert.equal((await call('POST', `/api/devoluciones/${s.body.id}/asignar`, 'devoluciones', { order_id: oid })).status, 200);
+
+  assert.equal((await call('POST', '/api/alertas/run', 'comercial', { day: 'xx' })).status, 400);
+  const { body: { ingesta_id } } = await call('POST', '/api/inventario/ingesta', 'bodega');
+  assert.equal((await call('POST', '/api/inventario/manual', 'bodega', { name: 'S', qty: 1, ingesta_id, photo: 'data:image/svg+xml,<svg/>' })).status, 400);
+  assert.equal((await call('POST', '/api/inventario/scan', 'bodega', { barcode: '111' })).status, 400, 'missing ingesta_id -> 400 not 500');
+
+  const raw = await new Promise((resolve) => { import('node:net').then(({ createConnection }) => { const c = createConnection(app.server.address().port, 'localhost'); let d = ''; c.on('data', (x) => (d += x)); c.on('close', () => resolve(d)); c.write('GET http://[ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n'); }); });
+  assert.match(raw, /400/);
+  assert.equal((await fetch(`${base}/api/inventario/stock?t=${tokens.bodega}`)).status, 401, '?t not accepted outside SSE');
+
+  await call('POST', '/api/logout', 'comercial');
+  assert.equal((await call('GET', '/api/alertas', 'comercial')).status, 401);
+});
+
+test('login throttled after repeated failures (per ip+user)', async () => {
+  for (let i = 0; i < 6; i++) await call('POST', '/api/login', null, { user_id: 3, pin: 'bad' });
+  const r = await call('POST', '/api/login', null, { user_id: 3, pin: '1234' });
+  assert.equal(r.status, 429); // same ip is throttled (expected); other ips unaffected by design
+});

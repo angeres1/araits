@@ -42,8 +42,8 @@ test('FR-1 scan adds stock per scan; unknown barcode 404; closed ingesta rejecte
   assert.equal((await call('POST', '/api/inventario/scan', 'bodega', { barcode: '111', ingesta_id })).status, 200);
   assert.equal((await call('POST', '/api/inventario/scan', 'bodega', { barcode: '111', qty: 10, ingesta_id })).status, 200);
   assert.equal((await call('POST', '/api/inventario/scan', 'bodega', { barcode: 'nope', ingesta_id })).status, 404);
-  const stock = (await call('GET', '/api/inventario/stock?q=Prod', 'alistamiento')).body;
-  assert.equal(stock[0].stock, 21);
+  const stock = (await call('GET', '/api/inventario/stock?q=Prod', 'alistamiento')).body.items;
+  assert.equal(stock.find((x) => x.name === 'Prod A').stock, 21);
   const closed = await call('POST', `/api/inventario/ingesta/${ingesta_id}/cerrar`, 'bodega');
   assert.equal(closed.body.unidades, 11);
   assert.equal((await call('POST', '/api/inventario/scan', 'bodega', { barcode: '111', ingesta_id })).status, 409);
@@ -59,7 +59,7 @@ test('FR-2 manual creates reference without barcode and is audited as manual', a
 test('FR-3 reservations reduce available; dispatch needs physical stock; semaforo', async () => {
   app.db.prepare("INSERT INTO products (sku, barcode, name, stock, low_threshold) VALUES ('B','222','Prod B',3,5)").run();
   app.db.prepare("INSERT INTO orders (dropshipper_id, product_id, qty, channel, status, created_at) VALUES (1,3,2,'mercadolibre','pendiente',?)").run(new Date().toISOString());
-  const b = (await call('GET', '/api/inventario/stock?q=Prod B', 'alistamiento')).body[0];
+  const b = (await call('GET', '/api/inventario/stock?q=Prod B', 'alistamiento')).body.items[0];
   assert.deepEqual([b.stock, b.reserved, b.available, b.semaforo], [3, 2, 1, 'amarillo']);
   const orders = (await call('GET', '/api/pedidos', 'alistamiento')).body;
   const d = await call('POST', `/api/pedidos/${orders[0].id}/despachar`, 'alistamiento');
@@ -156,4 +156,53 @@ test('login throttled after repeated failures (per ip+user)', async () => {
   for (let i = 0; i < 6; i++) await call('POST', '/api/login', null, { user_id: 3, pin: 'bad' });
   const r = await call('POST', '/api/login', null, { user_id: 3, pin: '1234' });
   assert.equal(r.status, 429); // same ip is throttled (expected); other ips unaffected by design
+});
+
+test('v2: idempotent scan by client_id, offline ingesta_ref, ingesta ownership', async () => {
+  const ref = 'ref-' + Math.random().toString(36).slice(2, 12);
+  const body = { barcode: '111', qty: 1, ingesta_ref: ref, client_id: 'cid-' + Math.random().toString(36).slice(2, 12) };
+  const before = app.db.prepare("SELECT stock FROM products WHERE barcode='111'").get().stock;
+  assert.equal((await call('POST', '/api/inventario/scan', 'bodega', body)).status, 200);
+  const again = await call('POST', '/api/inventario/scan', 'bodega', body);
+  assert.equal(again.body.duplicate, true);
+  assert.equal(app.db.prepare("SELECT stock FROM products WHERE barcode='111'").get().stock, before + 1, 'retry does not double count');
+  const other = { ...body, client_id: 'cid-' + Math.random().toString(36).slice(2, 12) };
+  assert.equal((await call('POST', '/api/inventario/scan', 'admin', other)).status, 200, 'admin may use any ingesta');
+  assert.equal((await call('POST', '/api/inventario/ingesta/cerrar', 'bodega', { ingesta_ref: ref })).body.unidades, 2);
+});
+
+test('v2: pin change rules + forced change gate + admin users', async () => {
+  const created = await call('POST', '/api/admin/users', 'admin', { name: 'Nuevo', role: 'bodega' });
+  assert.equal(created.status, 200);
+  const lg = await call('POST', '/api/login', null, { user_id: created.body.id, pin: created.body.temp_pin });
+  assert.equal(lg.body.user.must_change_pin, true);
+  tokens.nuevo = lg.body.token;
+  assert.equal((await call('GET', '/api/inventario/stock', 'nuevo')).status, 403, 'blocked until PIN changed');
+  assert.equal((await call('POST', '/api/pin', 'nuevo', { old_pin: created.body.temp_pin, new_pin: '111111' })).status, 400, 'weak');
+  assert.equal((await call('POST', '/api/pin', 'nuevo', { old_pin: created.body.temp_pin, new_pin: '123' })).status, 400, 'short');
+  assert.equal((await call('POST', '/api/pin', 'nuevo', { old_pin: created.body.temp_pin, new_pin: '482913' })).status, 200);
+  assert.equal((await call('GET', '/api/inventario/stock', 'nuevo')).status, 200);
+  assert.equal((await call('PATCH', `/api/admin/users/${created.body.id}`, 'admin', { active: false })).status, 200);
+  assert.equal((await call('GET', '/api/inventario/stock', 'nuevo')).status, 401, 'deactivated session dies');
+  assert.equal((await call('GET', '/api/admin/users', 'bodega')).status, 403);
+});
+
+test('v2: dashboard, paging/estado filter, pending units, csv safe, import, sync with cancel + log', async () => {
+  const d = (await call('GET', '/api/dashboard', 'bodega')).body;
+  assert.equal(d.series.length, 14);
+  assert.ok('rojo' in d.stock && 'ingreso_manual_pct' in d.calidad);
+  const rojo = (await call('GET', '/api/inventario/stock?estado=rojo&limit=1', 'bodega')).body;
+  assert.ok(rojo.items.length <= 1 && rojo.items.every((x) => x.semaforo === 'rojo'));
+  assert.ok(Array.isArray((await call('GET', '/api/devoluciones/pendientes', 'operador')).body));
+  const imp = await call('POST', '/api/productos/import', 'admin', { csv: 'sku,barcode,name,stock,low_threshold\nZ1,999,=HYPERLINK("x"),5,2\nZ2,999,Dup barcode,1,1\n,,,,' });
+  assert.equal(imp.body.created, 1); assert.equal(imp.body.errors.length, 2);
+  const rep = await call('GET', '/api/reportes/movimientos', 'alistamiento');
+  assert.ok(rep.body.csv.startsWith('fecha,sku'));
+  assert.equal((await call('GET', '/api/reportes/movimientos', 'bodega')).status, 403);
+  assert.equal((await call('GET', '/api/reportes/nada', 'alistamiento')).status, 404);
+  assert.equal((await call('POST', '/api/productos/import', 'bodega', { csv: 'x' })).status, 403);
+  const sy = await call('POST', '/api/sync', 'admin');
+  assert.equal(sy.body.mode, 'mock');
+  await new Promise((r) => setTimeout(r, 50));
+  assert.ok((await call('GET', '/api/sync/log', 'admin')).body.length >= 1);
 });

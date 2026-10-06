@@ -5,14 +5,16 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { openDb } from './db.js';
 import * as L from './logic.js';
-import { login, logout, userFromToken, publicUsers, can } from './auth.js';
-import { syncOrders, mode } from './adapters.js';
+import { login, logout, userFromToken, publicUsers, can, changePin, listUsers, createUser, resetUserPin, setUserActive } from './auth.js';
+import { syncOrders, mode, startStockPush } from './adapters.js';
+import * as X from './extra.js';
 
 const PUBLIC = join(fileURLToPath(import.meta.url), '../../public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png' };
 
 export function createApp(db = openDb()) {
   const bus = new EventEmitter();
+  const sseCount = new Map();
   bus.setMaxListeners(200);
 
   // [method, regex, permission|null(public)|'auth', handler(ctx)]
@@ -22,14 +24,25 @@ export function createApp(db = openDb()) {
   r('GET', '/api/users', null, () => publicUsers(db));
   r('POST', '/api/login', null, ({ body, ip }) => login(db, body, ip));
   r('POST', '/api/logout', 'auth', ({ token }) => logout(db, token));
-  r('GET', '/api/me', 'auth', ({ user }) => ({ ...user, channels: mode() }));
+  r('GET', '/api/me', 'auth', ({ user }) => ({ ...user, must_change_pin: !!user.must_change_pin, channels: mode() }));
+  r('POST', '/api/pin', 'auth', ({ user, token, body }) => changePin(db, user, token, body));
+  r('GET', '/api/dashboard', 'dashboard', () => X.dashboard(db));
+  r('GET', '/api/reportes/:kind', 'reportes', ({ params, query }) => ({ csv: X.reportCsv(db, params.kind, query) }));
+  r('PATCH', '/api/productos/:id', 'admin', ({ params, body, user }) => { const r = X.updateProduct(db, Number(params.id), body); X.audit(db, user.id, 'producto.editar', params.id); return r; });
+  r('POST', '/api/productos/import', 'admin', ({ body, user }) => { const r = X.importProducts(db, body.csv, user.id); X.audit(db, user.id, 'productos.importar', `${r.created} nuevos, ${r.updated} actualizados`); bus.emit('stock', {}); return r; });
+  r('GET', '/api/admin/users', 'admin', () => listUsers(db));
+  r('POST', '/api/admin/users', 'admin', ({ body, user }) => { const r = createUser(db, body); X.audit(db, user.id, 'usuario.crear', `${r.name}/${r.role}`); return r; });
+  r('POST', '/api/admin/users/:id/reset-pin', 'admin', ({ params, user }) => { const r = resetUserPin(db, Number(params.id)); X.audit(db, user.id, 'usuario.reset_pin', params.id); return r; });
+  r('PATCH', '/api/admin/users/:id', 'admin', ({ params, body, user }) => { const r = setUserActive(db, Number(params.id), !!body.active, user.id); X.audit(db, user.id, 'usuario.activo', `${params.id}=${body.active}`); return r; });
+  r('GET', '/api/sync/log', 'admin', () => X.listSyncLog(db));
 
-  r('GET', '/api/inventario/stock', 'stock', ({ query }) => L.listStock(db, query.get('q') || ''));
+  r('GET', '/api/inventario/stock', 'stock', ({ query }) => L.listStock(db, { q: query.get('q') || '', estado: query.get('estado') || '', limit: query.get('limit'), offset: query.get('offset') }));
   r('GET', '/api/productos', 'stock', ({ query }) => L.searchProducts(db, query.get('q') || ''));
-  r('POST', '/api/inventario/ingesta', 'ingreso', ({ user }) => L.openIngesta(db, user.id));
-  r('POST', '/api/inventario/scan', 'ingreso', ({ body, user }) => L.scan(db, body, user.id, bus));
-  r('POST', '/api/inventario/manual', 'ingreso', ({ body, user }) => L.manualIngreso(db, body, user.id, bus));
-  r('POST', '/api/inventario/ingesta/:id/cerrar', 'ingreso', ({ params }) => L.closeIngesta(db, Number(params.id)));
+  r('POST', '/api/inventario/ingesta', 'ingreso', ({ user }) => L.openIngesta(db, user));
+  r('POST', '/api/inventario/scan', 'ingreso', ({ body, user }) => L.scan(db, body, user, bus));
+  r('POST', '/api/inventario/manual', 'ingreso', ({ body, user }) => L.manualIngreso(db, body, user, bus));
+  r('POST', '/api/inventario/ingesta/cerrar', 'ingreso', ({ body, user }) => L.closeIngesta(db, body, user));
+  r('POST', '/api/inventario/ingesta/:id/cerrar', 'ingreso', ({ params, user }) => L.closeIngesta(db, { ingesta_id: Number(params.id) }, user));
 
   r('GET', '/api/pedidos', 'pedidos', ({ query }) => L.listOrders(db, query.get('status') || 'pendiente'));
   r('POST', '/api/pedidos/:id/despachar', 'pedidos', ({ params }) => L.dispatchOrder(db, Number(params.id), bus));
@@ -37,6 +50,7 @@ export function createApp(db = openDb()) {
   r('POST', '/api/sync', 'admin', () => syncOrders(db, bus));
 
   r('GET', '/api/devoluciones', 'devoluciones_ver', ({ query }) => L.listReturns(db, query.get('status') || 'abierta'));
+  r('GET', '/api/devoluciones/pendientes', 'devoluciones_ver', () => L.pendingUnits(db));
   r('GET', '/api/devoluciones/:id', 'devoluciones_ver', ({ params }) => L.getReturn(db, Number(params.id)));
   r('POST', '/api/devoluciones/vincular', 'vincular', ({ body, user }) => L.vincular(db, body, user.id));
   r('POST', '/api/devoluciones/sin-detalle', 'vincular', ({ body, user }) => L.sinDetalle(db, body, user.id));
@@ -70,19 +84,23 @@ export function createApp(db = openDb()) {
       if (perm) {
         user = userFromToken(db, token);
         if (!user) throw new L.HttpError(401, 'no_autenticado');
+        if (user.must_change_pin && !['/api/me', '/api/pin', '/api/logout'].includes(url.pathname)) throw new L.HttpError(403, 'cambiar_pin', 'Debes cambiar tu PIN antes de continuar.');
         if (perm !== 'auth' && !(perm === 'admin' ? user.role === 'admin' : can(user, perm))) throw new L.HttpError(403, 'sin_permiso');
       }
       const body = ['POST', 'PATCH', 'PUT'].includes(method) ? await readBody(req) : {};
       return send(res, 200, await fn({ params: m.groups || {}, query: url.searchParams, body, user, token, ip: req.socket.remoteAddress }));
     }
     if (url.pathname === '/api/events' && req.method === 'GET') {
-      if (!userFromToken(db, token)) throw new L.HttpError(401, 'no_autenticado');
+      const su = userFromToken(db, token);
+      if (!su) throw new L.HttpError(401, 'no_autenticado');
+      if ((sseCount.get(su.id) || 0) >= 5) throw new L.HttpError(429, 'demasiadas_conexiones');
+      sseCount.set(su.id, (sseCount.get(su.id) || 0) + 1);
       res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
       res.write('retry: 2000\n\n');
       const on = (d) => res.write(`event: stock\ndata: ${JSON.stringify(d)}\n\n`);
       bus.on('stock', on);
       const ka = setInterval(() => { if (!userFromToken(db, token)) return res.end(); res.write(': ka\n\n'); }, 25000);
-      req.on('close', () => { bus.off('stock', on); clearInterval(ka); });
+      req.on('close', () => { bus.off('stock', on); clearInterval(ka); sseCount.set(su.id, (sseCount.get(su.id) || 1) - 1); });
       return;
     }
     throw new L.HttpError(404, 'no_encontrado');
@@ -128,10 +146,11 @@ export function startWorker(db) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const { server, db } = createApp();
+  const { server, db, bus } = createApp();
   process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e));
   process.on('uncaughtException', (e) => console.error('[uncaughtException]', e));
   startWorker(db);
+  startStockPush(db, bus);
   const port = Number(process.env.PORT || 3000);
   server.listen(port, () => console.log(`Log_Proj MVP en http://localhost:${port}  (canales: ${mode()})`));
 }

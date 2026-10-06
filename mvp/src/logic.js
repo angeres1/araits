@@ -25,59 +25,81 @@ export function semaforo(available, low) {
   return 'verde';
 }
 
-export function listStock(db, q = '') {
+// Paged, urgency-first stock list. estado: rojo|amarillo|verde filters on available vs per-product threshold.
+export function listStock(db, { q = '', estado = '', limit = 50, offset = 0 } = {}) {
   const like = `%${clean(q, 60)}%`;
-  const rows = db.prepare(
-    `SELECT p.id, p.sku, p.barcode, p.name, p.photo IS NOT NULL AS has_photo, p.stock, p.low_threshold, p.source,
-            ${reservedSql} AS reserved
-     FROM products p WHERE p.name LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ? ORDER BY p.name LIMIT 200`
-  ).all(like, like, like);
-  return rows.map((r) => {
-    const available = r.stock - r.reserved;
-    return { ...r, has_photo: !!r.has_photo, available, semaforo: semaforo(available, r.low_threshold) };
-  });
+  const lim = Math.min(Math.max(Number(limit) || 50, 1), 200), off = Math.max(Number(offset) || 0, 0);
+  const est = ['rojo', 'amarillo', 'verde'].includes(estado) ? estado : '';
+  const base = `WITH s AS (
+      SELECT p.id, p.sku, p.barcode, p.name, p.photo IS NOT NULL AS has_photo, p.stock, p.low_threshold, p.source, p.location,
+             ${reservedSql} AS reserved FROM products p WHERE (p.name LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ?)),
+    t AS (SELECT *, stock - reserved AS available,
+             CASE WHEN stock - reserved <= 0 THEN 'rojo' WHEN stock - reserved <= low_threshold THEN 'amarillo' ELSE 'verde' END AS semaforo FROM s)`;
+  const where = est ? 'WHERE semaforo = ?' : '';
+  const args = est ? [like, like, like, est] : [like, like, like];
+  const total = db.prepare(`${base} SELECT COUNT(*) AS n FROM t ${where}`).get(...args).n;
+  const items = db.prepare(`${base} SELECT * FROM t ${where}
+    ORDER BY CASE semaforo WHEN 'rojo' THEN 0 WHEN 'amarillo' THEN 1 ELSE 2 END, name LIMIT ? OFFSET ?`).all(...args, lim, off)
+    .map((r) => ({ ...r, has_photo: !!r.has_photo }));
+  return { items, total };
 }
 
-export function openIngesta(db, userId) {
-  const r = db.prepare('INSERT INTO ingestas (user_id, opened_at) VALUES (?, ?)').run(userId, now());
+export function openIngesta(db, user) {
+  const r = db.prepare('INSERT INTO ingestas (user_id, opened_at) VALUES (?, ?)').run(user.id, now());
   return { ingesta_id: Number(r.lastInsertRowid) };
 }
 
-function requireIngesta(db, id) {
-  const ing = db.prepare('SELECT * FROM ingestas WHERE id = ?').get(id);
+// Accepts a numeric ingesta_id (online flow) or a client-generated ingesta_ref (offline-capable flow: created on first use).
+function resolveIngesta(db, { ingesta_id, ingesta_ref }, user) {
+  let ing;
+  if (typeof ingesta_ref === 'string' && /^[\w-]{8,64}$/.test(ingesta_ref)) {
+    ing = db.prepare('SELECT * FROM ingestas WHERE ref = ?').get(ingesta_ref);
+    if (!ing) {
+      const r = db.prepare('INSERT INTO ingestas (user_id, opened_at, ref) VALUES (?,?,?)').run(user.id, now(), ingesta_ref);
+      ing = db.prepare('SELECT * FROM ingestas WHERE id = ?').get(r.lastInsertRowid);
+    }
+  } else if (Number.isInteger(ingesta_id)) {
+    ing = db.prepare('SELECT * FROM ingestas WHERE id = ?').get(ingesta_id);
+  } else throw new HttpError(400, 'ingesta_requerida');
   if (!ing) throw new HttpError(404, 'ingesta_no_existe');
+  if (ing.user_id !== user.id && user.role !== 'admin') throw new HttpError(403, 'ingesta_ajena');
   if (ing.closed_at) throw new HttpError(409, 'ingesta_cerrada');
   return ing;
 }
 
-function addStock(db, product, qty, { via, ingestaId, userId, type = 'ingreso', ref = null }) {
+function addStock(db, product, qty, { via, ingestaId, userId, type = 'ingreso', ref = null, clientId = null }) {
   db.prepare('UPDATE products SET stock = stock + ? WHERE id = ?').run(qty, product.id);
-  db.prepare('INSERT INTO stock_movements (product_id, qty, type, via, ref, ingesta_id, user_id, created_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run(product.id, qty, type, via, ref, ingestaId ?? null, userId ?? null, now());
+  db.prepare('INSERT INTO stock_movements (product_id, qty, type, via, ref, ingesta_id, user_id, client_id, created_at) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run(product.id, qty, type, via, ref, ingestaId ?? null, userId ?? null, clientId, now());
 }
 
-// FR-1: commit per scan (not per batch) so a network drop loses nothing.
-export function scan(db, { barcode, qty, ingesta_id }, userId, bus) {
-  const code = clean(barcode, 64);
+const cid = (v) => (typeof v === 'string' && /^[\w-]{8,64}$/.test(v) ? v : null);
+
+// FR-1: commit per scan (not per batch) so a network drop loses nothing. client_id makes retries idempotent.
+export function scan(db, body, user, bus) {
+  const code = clean(body.barcode, 64);
   if (!code) throw new HttpError(400, 'codigo_requerido');
-  const n = posInt(qty);
-  if (!Number.isInteger(ingesta_id)) throw new HttpError(400, 'ingesta_id_requerido');
+  const n = posInt(body.qty);
+  const clientId = cid(body.client_id);
   return tx(db, () => {
-    requireIngesta(db, ingesta_id);
+    if (clientId && db.prepare('SELECT 1 FROM stock_movements WHERE client_id = ?').get(clientId)) return { reconocido: true, duplicate: true };
+    const ing = resolveIngesta(db, body, user);
     const p = db.prepare('SELECT * FROM products WHERE barcode = ?').get(code);
     if (!p) throw new HttpError(404, 'producto_no_reconocido', 'Código no reconocido. Usa "Sin código de barras".');
-    addStock(db, p, n, { via: 'escaneo', ingestaId: ingesta_id, userId });
+    addStock(db, p, n, { via: 'escaneo', ingestaId: ing.id, userId: user.id, clientId });
     bus?.emit('stock', { product_id: p.id });
-    return { reconocido: true, product: { id: p.id, name: p.name, stock: p.stock + n } };
+    return { reconocido: true, ingesta_id: ing.id, product: { id: p.id, name: p.name, stock: p.stock + n } };
   });
 }
 
 // FR-2: manual fallback; creates the reference on the spot if it doesn't exist.
-export function manualIngreso(db, { product_id, name, photo, qty, ingesta_id }, userId, bus) {
-  const n = posInt(qty);
-  if (!Number.isInteger(ingesta_id)) throw new HttpError(400, 'ingesta_id_requerido');
+export function manualIngreso(db, body, user, bus) {
+  const { product_id, name, photo } = body;
+  const n = posInt(body.qty);
+  const clientId = cid(body.client_id);
   return tx(db, () => {
-    requireIngesta(db, ingesta_id);
+    if (clientId && db.prepare('SELECT 1 FROM stock_movements WHERE client_id = ?').get(clientId)) return { duplicate: true };
+    const ing = resolveIngesta(db, body, user);
     let p;
     if (product_id) {
       p = db.prepare('SELECT * FROM products WHERE id = ?').get(product_id);
@@ -92,18 +114,18 @@ export function manualIngreso(db, { product_id, name, photo, qty, ingesta_id }, 
         .run(sku, null, nm, photo || null, 'manual');
       p = db.prepare('SELECT * FROM products WHERE id = ?').get(r.lastInsertRowid);
     }
-    addStock(db, p, n, { via: 'manual', ingestaId: ingesta_id, userId });
+    addStock(db, p, n, { via: 'manual', ingestaId: ing.id, userId: user.id, clientId });
     bus?.emit('stock', { product_id: p.id });
-    return { product: { id: p.id, name: p.name, stock: p.stock + n } };
+    return { ingesta_id: ing.id, product: { id: p.id, name: p.name, stock: p.stock + n } };
   });
 }
 
-export function closeIngesta(db, id) {
-  requireIngesta(db, id);
-  db.prepare('UPDATE ingestas SET closed_at = ? WHERE id = ?').run(now(), id);
+export function closeIngesta(db, body, user) {
+  const ing = resolveIngesta(db, body, user);
+  db.prepare('UPDATE ingestas SET closed_at = ? WHERE id = ?').run(now(), ing.id);
   const s = db.prepare(`SELECT COUNT(*) AS movimientos, COALESCE(SUM(qty),0) AS unidades,
-    COALESCE(SUM(CASE WHEN via='manual' THEN qty END),0) AS manual FROM stock_movements WHERE ingesta_id = ?`).get(id);
-  return { ingesta_id: id, ...s };
+    COALESCE(SUM(CASE WHEN via='manual' THEN qty END),0) AS manual FROM stock_movements WHERE ingesta_id = ?`).get(ing.id);
+  return { ingesta_id: ing.id, ...s };
 }
 
 export function searchProducts(db, q) {
@@ -317,4 +339,12 @@ export function setUmbral(db, id, pct) {
 
 export function listDropshippers(db) {
   return db.prepare('SELECT id, name, phone, umbral_pct FROM dropshippers ORDER BY name').all();
+}
+
+// Units waiting for tipificación across all open returns (single query for the operator screen).
+export function pendingUnits(db) {
+  return db.prepare(`SELECT u.id, u.return_id, u.qty, u.match, r.guia_retorno, r.sin_detalle, p.name AS product, d.name AS dropshipper, o.guia_despacho
+    FROM return_units u JOIN returns r ON r.id = u.return_id JOIN orders o ON o.id = u.order_id
+    JOIN products p ON p.id = u.product_id JOIN dropshippers d ON d.id = o.dropshipper_id
+    WHERE u.causa IS NULL ORDER BY u.created_at LIMIT 100`).all();
 }

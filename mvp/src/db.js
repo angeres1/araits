@@ -7,7 +7,25 @@ export function openDb(path = process.env.DB_PATH || 'data/app.db') {
   const db = new DatabaseSync(path);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
   db.exec(SCHEMA);
+  migrate(db);
   return db;
+}
+
+function ensureColumn(db, table, col, ddl) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some((c) => c.name === col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+}
+
+// Lightweight forward migrations for DBs created by earlier versions.
+function migrate(db) {
+  ensureColumn(db, 'users', 'must_change_pin', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(db, 'users', 'active', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn(db, 'ingestas', 'ref', 'TEXT');
+  ensureColumn(db, 'stock_movements', 'client_id', 'TEXT');
+  ensureColumn(db, 'orders', 'external_id', 'TEXT');
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS ux_ingestas_ref ON ingestas(ref) WHERE ref IS NOT NULL;
+           CREATE UNIQUE INDEX IF NOT EXISTS ux_mov_client ON stock_movements(client_id) WHERE client_id IS NOT NULL;
+           CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_ext ON orders(channel, external_id) WHERE external_id IS NOT NULL;
+           CREATE INDEX IF NOT EXISTS idx_mov_created ON stock_movements(created_at);`);
 }
 
 // Run fn inside a transaction; rolls back on throw (FR-4/FR-6 integrity NFR).
@@ -60,6 +78,13 @@ CREATE TABLE IF NOT EXISTS return_units (
   id INTEGER PRIMARY KEY, return_id INTEGER NOT NULL REFERENCES returns(id), order_id INTEGER NOT NULL REFERENCES orders(id),
   product_id INTEGER NOT NULL, qty INTEGER NOT NULL DEFAULT 1, match TEXT NOT NULL,
   causa TEXT, restocked INTEGER NOT NULL DEFAULT 0, closed_at TEXT, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS channel_sync_log (
+  id INTEGER PRIMARY KEY, channel TEXT NOT NULL, direction TEXT NOT NULL, product_id INTEGER, detail TEXT,
+  mode TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id INTEGER PRIMARY KEY, user_id INTEGER, action TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS alerts (
   id INTEGER PRIMARY KEY, dropshipper_id INTEGER NOT NULL REFERENCES dropshippers(id), day TEXT NOT NULL,
